@@ -271,6 +271,18 @@ jobs:
 
       - name: Inject Custom Shortcuts Code
         run: |
+          echo "==> Создаем ресурсы строк..."
+          mkdir -p app/src/main/res/values
+          cat << 'EOF' > app/src/main/res/values/custom_strings.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="shortcut_start_short">Start</string>
+              <string name="shortcut_start_long">Start VPN</string>
+              <string name="shortcut_stop_short">Stop</string>
+              <string name="shortcut_stop_long">Stop VPN</string>
+          </resources>
+          EOF
+
           echo "==> Создаем shortcuts.xml с нуля..."
           mkdir -p app/src/main/res/xml
           cat << 'EOF' > app/src/main/res/xml/shortcuts.xml
@@ -279,9 +291,9 @@ jobs:
               <shortcut
                   android:shortcutId="start_vpn"
                   android:enabled="true"
-                  android:icon="@drawable/ic_stat_name"
-                  android:shortcutShortLabel="Start"
-                  android:shortcutLongLabel="Start VPN">
+                  android:icon="@drawable/ic_play_arrow_24"
+                  android:shortcutShortLabel="@string/shortcut_start_short"
+                  android:shortcutLongLabel="@string/shortcut_start_long">
                   <intent
                       android:action="io.nekohasekai.sfa.ACTION_START"
                       android:targetPackage="io.nekohasekai.sfa"
@@ -290,15 +302,46 @@ jobs:
               <shortcut
                   android:shortcutId="stop_vpn"
                   android:enabled="true"
-                  android:icon="@drawable/ic_stat_name"
-                  android:shortcutShortLabel="Stop"
-                  android:shortcutLongLabel="Stop VPN">
+                  android:icon="@drawable/ic_stop_24"
+                  android:shortcutShortLabel="@string/shortcut_stop_short"
+                  android:shortcutLongLabel="@string/shortcut_stop_long">
                   <intent
                       android:action="io.nekohasekai.sfa.ACTION_STOP"
                       android:targetPackage="io.nekohasekai.sfa"
                       android:targetClass="io.nekohasekai.sfa.compose.MainActivity" />
               </shortcut>
           </shortcuts>
+          EOF
+
+          echo "==> Патчим AndroidManifest.xml (добавляем ссылку на ярлыки)..."
+          if ! grep -q "android.app.shortcuts" app/src/main/AndroidManifest.xml; then
+            sed -i '/\.compose\.MainActivity"/,/<\/activity>/ s/<\/activity>/    <meta-data android:name="android.app.shortcuts" android:resource="@xml\/shortcuts" \/>\n        <\/activity>/' app/src/main/AndroidManifest.xml
+          fi
+
+          echo "==> Патчим MainActivity.kt (перехватчики в методах)..."
+          sed -i 's/super\.onCreate(savedInstanceState)/super.onCreate(savedInstanceState)\n        if (handleShortcut(intent)) return/' app/src/main/java/io/nekohasekai/sfa/compose/MainActivity.kt
+          sed -i 's/super\.onNewIntent(intent)/super.onNewIntent(intent)\n        if (handleShortcut(intent)) return/' app/src/main/java/io/nekohasekai/sfa/compose/MainActivity.kt
+
+          echo "==> Патчим MainActivity.kt (инъекция функции)..."
+          LAST_BRACE_LINE=$(grep -n "}" app/src/main/java/io/nekohasekai/sfa/compose/MainActivity.kt | tail -1 | cut -d: -f1)
+          sed -i "${LAST_BRACE_LINE},\$d" app/src/main/java/io/nekohasekai/sfa/compose/MainActivity.kt
+          
+          cat << 'EOF' >> app/src/main/java/io/nekohasekai/sfa/compose/MainActivity.kt
+
+              private fun handleShortcut(currentIntent: android.content.Intent?): Boolean {
+                  val action = currentIntent?.action
+                  if (action == "io.nekohasekai.sfa.ACTION_START") {
+                      try { startService() } catch(e: Exception) {}
+                      finish()
+                      return true
+                  } else if (action == "io.nekohasekai.sfa.ACTION_STOP") {
+                      try { io.nekohasekai.sfa.bg.BoxService.stop() } catch(e: Exception) {}
+                      finish()
+                      return true
+                  }
+                  return false
+              }
+          }
           EOF
 
           echo "==> Патчим AndroidManifest.xml (добавляем ссылку на ярлыки)..."
