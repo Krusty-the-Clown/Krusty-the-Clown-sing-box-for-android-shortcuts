@@ -113,24 +113,6 @@ jobs:
           echo "CORE_SHA=$CORE_SHA" >> $GITHUB_ENV
           echo "CORE_DATE=$CORE_DATE" >> $GITHUB_ENV
 
-      - name: Check for "Bump version" marker (informational only, no checkout)
-        if: ${{ github.event.inputs.app_ref == '' }}
-        run: |
-          TAG_NO_V="${TARGET_TAG#v}"
-          echo "Ищем точный коммит 'Bump version $TAG_NO_V' (только для справки, не переключаемся)..."
-          BUMP_SHA=$(git log origin/main --all --grep="Bump version $TAG_NO_V" --fixed-strings -n1 --format=%H)
-
-          if [ -n "$BUMP_SHA" ]; then
-            echo "ℹ️ Автор синхронизировал приложение с этой версией ядра в коммите: $BUMP_SHA"
-            if git merge-base --is-ancestor "$BUMP_SHA" HEAD 2>/dev/null; then
-              echo "✅ Этот коммит уже входит в историю текущего HEAD — версии согласованы, ничего переключать не нужно"
-            else
-              echo "⚠️ Этот коммит НЕ входит в историю текущего HEAD (разные ветки/форки) — используется как справка, но не как точка переключения"
-            fi
-          else
-            echo "ℹ️ Точного коммита 'Bump version $TAG_NO_V' не найдено — версии могут быть не идеально синхронизированы, но авто-подбор компилируемого коммита это не блокирует"
-          fi
-
       - name: Download official libbox.aar (matching resolved tag)
         env:
           GH_TOKEN: ${{ github.token }}
@@ -142,16 +124,9 @@ jobs:
 
           if [ -z "$RUN_ID" ]; then
             echo "❌ Успешного прогона workflow Build для коммита $CORE_SHA не нашлось"
-            echo "Все прогоны для этого коммита (для диагностики):"
-            gh api "repos/SagerNet/sing-box/actions/runs?head_sha=${CORE_SHA}" \
-              -q '.workflow_runs[] | "\(.name) — \(.conclusion) — \(.html_url)"'
             exit 1
           fi
-          echo "ID сборки: $RUN_ID"
-
-          echo "Артефакты этого запуска:"
-          gh api repos/SagerNet/sing-box/actions/runs/$RUN_ID/artifacts -q '.artifacts[].name'
-
+          
           ARTIFACT_NAMES=$(gh api repos/SagerNet/sing-box/actions/runs/$RUN_ID/artifacts \
             -q '.artifacts[] | select(.name | test("android|aar|libbox"; "i")) | .name')
 
@@ -164,15 +139,6 @@ jobs:
             echo "Скачиваю артефакт: $NAME"
             gh run download $RUN_ID -R SagerNet/sing-box -n "$NAME" -D "/tmp/artifacts/$NAME"
           done <<< "$ARTIFACT_NAMES"
-
-          echo "=== Полное содержимое скачанных артефактов (для диагностики) ==="
-          find /tmp/artifacts -type f | while read -r f; do
-            echo "--- $f ---"
-            file "$f"
-            case "$f" in
-              *.zip|*.aar|*.apk) unzip -l "$f" 2>/dev/null | head -30 ;;
-            esac
-          done
 
           FOUND=0
           for aar_file in $(find /tmp/artifacts -type f -name "*.aar"); do
@@ -194,32 +160,21 @@ jobs:
         run: |
           set -e
           GO_VERSION="1.24.0"
-          echo "Клонирую sing-box@$TARGET_TAG..."
           git clone --depth 1 --branch "$TARGET_TAG" https://github.com/SagerNet/sing-box.git /tmp/sing-box-src
-
           REQUIRED_GO=$(grep -m1 '^go ' /tmp/sing-box-src/go.mod | awk '{print $2}')
-          if [ -n "$REQUIRED_GO" ]; then
-            echo "go.mod требует Go $REQUIRED_GO — использую именно эту версию вместо $GO_VERSION"
-            GO_VERSION="$REQUIRED_GO"
-          fi
+          if [ -n "$REQUIRED_GO" ]; then GO_VERSION="$REQUIRED_GO"; fi
 
-          echo "Устанавливаю Go $GO_VERSION..."
           curl -sSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tar.gz
           sudo tar -C /usr/local -xzf /tmp/go.tar.gz
           export PATH=/usr/local/go/bin:$PATH:$(go env GOPATH)/bin
           export GOTOOLCHAIN=local
-          go version
 
-          echo "Ставлю gomobile/gobind v0.1.12..."
           go install -v github.com/sagernet/gomobile/cmd/gomobile@v0.1.12
           go install -v github.com/sagernet/gomobile/cmd/gobind@v0.1.12
-
-          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME (из preinstalled Android SDK на runner'е)"
           gomobile init
 
           cd /tmp/sing-box-src
           VERSION=$(echo "$TARGET_TAG" | sed 's/^v//')
-          echo "Собираю libbox.aar (версия $VERSION, это может занять 10-20 минут)..."
           gomobile bind -v -androidapi 21 -trimpath \
             -ldflags "-X github.com/sagernet/sing-box/constant.Version=$VERSION -s -w -buildid=" \
             -tags "with_gvisor,with_quic,with_wireguard,with_utls,with_clash_api,with_conntrack" \
@@ -230,20 +185,6 @@ jobs:
 
           mkdir -p "$GITHUB_WORKSPACE/app/libs"
           cp /tmp/sing-box-src/libbox.aar "$GITHUB_WORKSPACE/app/libs/libbox.aar"
-          echo "✅ Собрано и скопировано libbox.aar"
-
-      - name: Print embedded core version from libbox.aar (ground truth)
-        run: |
-          mkdir -p /tmp/aar_inspect
-          unzip -o app/libs/libbox.aar -d /tmp/aar_inspect > /dev/null
-          SO_FILE=$(find /tmp/aar_inspect -name "libbox.so" -path "*arm64-v8a*" | head -n1)
-          if [ -z "$SO_FILE" ]; then
-            echo "⚠️ Не удалось найти libbox.so внутри aar для проверки"
-          else
-            echo "Версия, реально зашитая в $SO_FILE:"
-            strings "$SO_FILE" | grep -E "^v?1\.[0-9]+\.[0-9]+(-(beta|rc)\.[0-9]+)?$" | sort -u | head -20
-          fi
-          echo "(Для сравнения: целевой тег из шага резолва — $TARGET_TAG)"
 
       - name: Make gradlew executable
         run: chmod +x gradlew
@@ -260,7 +201,6 @@ jobs:
               echo "✅ Коммит $CURRENT компилируется, используем его"
               break
             fi
-            echo "❌ Коммит $CURRENT не компилируется, откатываюсь на предыдущий"
             git reset --hard HEAD~1
             ATTEMPT=$((ATTEMPT+1))
           done
@@ -311,37 +251,6 @@ jobs:
                       android:targetClass="io.nekohasekai.sfa.compose.MainActivity" />
               </shortcut>
           </shortcuts>
-          EOF
-
-          echo "==> Патчим AndroidManifest.xml (добавляем ссылку на ярлыки)..."
-          if ! grep -q "android.app.shortcuts" app/src/main/AndroidManifest.xml; then
-            sed -i '/\.compose\.MainActivity"/,/<\/activity>/ s/<\/activity>/    <meta-data android:name="android.app.shortcuts" android:resource="@xml\/shortcuts" \/>\n        <\/activity>/' app/src/main/AndroidManifest.xml
-          fi
-
-          echo "==> Патчим MainActivity.kt (перехватчики в методах)..."
-          sed -i 's/super\.onCreate(savedInstanceState)/super.onCreate(savedInstanceState)\n        if (handleShortcut(intent)) return/' app/src/main/java/io/nekohasekai/sfa/compose/MainActivity.kt
-          sed -i 's/super\.onNewIntent(intent)/super.onNewIntent(intent)\n        if (handleShortcut(intent)) return/' app/src/main/java/io/nekohasekai/sfa/compose/MainActivity.kt
-
-          echo "==> Патчим MainActivity.kt (инъекция функции)..."
-          LAST_BRACE_LINE=$(grep -n "}" app/src/main/java/io/nekohasekai/sfa/compose/MainActivity.kt | tail -1 | cut -d: -f1)
-          sed -i "${LAST_BRACE_LINE},\$d" app/src/main/java/io/nekohasekai/sfa/compose/MainActivity.kt
-          
-          cat << 'EOF' >> app/src/main/java/io/nekohasekai/sfa/compose/MainActivity.kt
-
-              private fun handleShortcut(currentIntent: android.content.Intent?): Boolean {
-                  val action = currentIntent?.action
-                  if (action == "io.nekohasekai.sfa.ACTION_START") {
-                      try { startService() } catch(e: Exception) {}
-                      finish()
-                      return true
-                  } else if (action == "io.nekohasekai.sfa.ACTION_STOP") {
-                      try { io.nekohasekai.sfa.bg.BoxService.stop() } catch(e: Exception) {}
-                      finish()
-                      return true
-                  }
-                  return false
-              }
-          }
           EOF
 
           echo "==> Патчим AndroidManifest.xml (добавляем ссылку на ярлыки)..."
