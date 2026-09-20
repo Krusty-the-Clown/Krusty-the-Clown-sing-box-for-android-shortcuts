@@ -8,7 +8,7 @@ on:
         required: false
         default: ''
       core_tag:
-        description: 'Тег ИЛИ commit SHA ядра sing-box (пусто = автопоиск максимального beta/rc с готовым .aar)'
+        description: 'Тег ИЛИ commit SHA ядра sing-box (пусто = автопоиск максимального release/rc/beta с готовым .aar)'
         required: false
         default: ''
 
@@ -30,13 +30,13 @@ jobs:
           git fetch origin "${{ github.event.inputs.app_ref }}" || true
           git checkout "${{ github.event.inputs.app_ref }}"
 
-      - name: Set up Java 17 (Required for core build script)
+      - name: Set up Java
         uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
-          java-version: '17'
+          java-version: '21'
 
-      - name: Resolve core tag (manual override or auto beta/rc search)
+      - name: Resolve core tag (manual override or auto search)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -51,7 +51,7 @@ jobs:
             fi
             TARGET_TAG="$MANUAL_TAG"
           else
-            echo "Ищем самую свежую версию с готовым .aar-артефактом (релиз > rc > beta при равном номере)..."
+            echo "Ищем самую свежую версию (релиз > rc > beta при равном номере)..."
             ALL_TAGS=$(gh api repos/SagerNet/sing-box/tags --paginate)
             CANDIDATES=$(echo "$ALL_TAGS" | jq -r '
               [.[] | select(.name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+(-(beta|rc)\\.[0-9]+)?$"))
@@ -94,31 +94,25 @@ jobs:
                 CORE_SHA="$CAND_SHA"
                 break
               else
-                echo "⏭️  У тега $CAND_TAG сборка Build есть, но .aar-артефакта среди файлов нет (только бинарники/APK), пробуем следующий"
+                echo "⏭️  У тега $CAND_TAG сборка Build есть, но .aar-артефакта нет, пробуем следующий"
               fi
             done <<< "$CANDIDATES"
 
             if [ -z "$TARGET_TAG" ]; then
-              echo "❌ Ни у одного тега не нашлось готовой CI-сборки Build"
+              echo "❌ Ни у одного тега не нашлось готовой CI-сборки Build с .aar"
               exit 1
             fi
           fi
 
           echo "Тег ядра: $TARGET_TAG ($CORE_SHA)"
-
-          CORE_DATE=$(gh api repos/SagerNet/sing-box/commits/$CORE_SHA -q '.commit.committer.date')
-          echo "Дата коммита ядра: $CORE_DATE"
-
           echo "TARGET_TAG=$TARGET_TAG" >> $GITHUB_ENV
           echo "CORE_SHA=$CORE_SHA" >> $GITHUB_ENV
-          echo "CORE_DATE=$CORE_DATE" >> $GITHUB_ENV
 
       - name: Download official libbox.aar (matching resolved tag)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p app/libs
-          echo "Ищем прогон workflow Build по SHA коммита ядра: $CORE_SHA"
           RUN_ID=$(gh api "repos/SagerNet/sing-box/actions/runs?head_sha=${CORE_SHA}&status=success" \
             -q '.workflow_runs[] | select(.name=="Build") | .id' | head -n1)
 
@@ -126,7 +120,7 @@ jobs:
             echo "❌ Успешного прогона workflow Build для коммита $CORE_SHA не нашлось"
             exit 1
           fi
-          
+
           ARTIFACT_NAMES=$(gh api repos/SagerNet/sing-box/actions/runs/$RUN_ID/artifacts \
             -q '.artifacts[] | select(.name | test("android|aar|libbox"; "i")) | .name')
 
@@ -151,27 +145,23 @@ jobs:
           done
 
           if [ $FOUND -eq 0 ]; then
-            echo "⚠️ Готового .aar-артефакта нет — компилирую libbox.aar из исходников sing-box@$TARGET_TAG"
+            echo "⚠️ Готового .aar нет — компилирую из исходников через официальный build_libbox"
             echo "SKIP_PREBUILT=1" >> $GITHUB_ENV
           fi
 
-      - name: Setup exact Android NDK 28
-        if: ${{ env.SKIP_PREBUILT == '1' }}
-        run: |
-          echo "Устанавливаем NDK 28 для совместимости с cronet-go..."
-          echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --install "ndk;28.0.13004108"
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.0.13004108" >> $GITHUB_ENV
-
-      - name: Build libbox.aar from source (fallback when no prebuilt .aar exists)
+      - name: Build libbox.aar from source (official build_libbox script, fallback)
         if: ${{ env.SKIP_PREBUILT == '1' }}
         run: |
           set -e
-          GO_VERSION="1.24.0"
+          echo "Ставлю NDK 28.0.13004108 (та же версия, что требует build.gradle приложения)..."
+          echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --install "ndk;28.0.13004108" || echo "⚠️ Не удалось поставить явно, продолжаю со стандартным NDK раннера"
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/28.0.13004108"
+
           git clone --depth 1 --branch "$TARGET_TAG" https://github.com/SagerNet/sing-box.git /tmp/sing-box-src
           REQUIRED_GO=$(grep -m1 '^go ' /tmp/sing-box-src/go.mod | awk '{print $2}')
-          if [ -n "$REQUIRED_GO" ]; then GO_VERSION="$REQUIRED_GO"; fi
+          if [ -z "$REQUIRED_GO" ]; then REQUIRED_GO="1.24.0"; fi
 
-          curl -sSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tar.gz
+          curl -sSL "https://go.dev/dl/go${REQUIRED_GO}.linux-amd64.tar.gz" -o /tmp/go.tar.gz
           sudo tar -C /usr/local -xzf /tmp/go.tar.gz
           export PATH=/usr/local/go/bin:$PATH:$(go env GOPATH)/bin
           export GOTOOLCHAIN=local
@@ -181,17 +171,28 @@ jobs:
           gomobile init
 
           cd /tmp/sing-box-src
-          VERSION=$(echo "$TARGET_TAG" | sed 's/^v//')
-          gomobile bind -v -androidapi 21 -trimpath \
-            -ldflags "-X github.com/sagernet/sing-box/constant.Version=$VERSION -s -w -buildid=" \
-            -tags "with_gvisor,with_quic,with_wireguard,with_utls,with_clash_api,with_conntrack" \
-            -target android \
-            -javapkg io.nekohasekai \
-            -o /tmp/sing-box-src/libbox.aar \
-            ./experimental/libbox
+          echo "Собираю через официальный скрипт cmd/internal/build_libbox..."
+          go run ./cmd/internal/build_libbox -target android
 
+          AAR_PATH=$(find /tmp/sing-box-src -maxdepth 1 -name "libbox.aar")
+          if [ -z "$AAR_PATH" ]; then
+            echo "❌ build_libbox не создал libbox.aar"
+            exit 1
+          fi
           mkdir -p "$GITHUB_WORKSPACE/app/libs"
-          cp /tmp/sing-box-src/libbox.aar "$GITHUB_WORKSPACE/app/libs/libbox.aar"
+          cp "$AAR_PATH" "$GITHUB_WORKSPACE/app/libs/libbox.aar"
+          echo "✅ Собрано из исходников"
+
+      - name: Print embedded core version from libbox.aar (ground truth)
+        run: |
+          mkdir -p /tmp/aar_inspect
+          unzip -o app/libs/libbox.aar -d /tmp/aar_inspect > /dev/null
+          SO_FILE=$(find /tmp/aar_inspect -name "libbox.so" -path "*arm64-v8a*" | head -n1)
+          if [ -n "$SO_FILE" ]; then
+            echo "Версия, реально зашитая в $SO_FILE:"
+            strings "$SO_FILE" | grep -E "^v?[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$" | sort -u | head -20
+          fi
+          echo "(Для сравнения: целевой тег — $TARGET_TAG)"
 
       - name: Make gradlew executable
         run: chmod +x gradlew
@@ -203,20 +204,21 @@ jobs:
           ATTEMPT=0
           while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
             CURRENT=$(git rev-parse HEAD)
-            echo "Попытка $((ATTEMPT+1))/$MAX_ATTEMPTS: пробую скомпилировать коммит $CURRENT"
+            echo "Попытка $((ATTEMPT+1))/$MAX_ATTEMPTS: пробую скомпилировать чистый коммит $CURRENT"
             if ./gradlew :app:compileOtherDebugKotlin --no-daemon; then
-              echo "✅ Коммит $CURRENT компилируется, используем его"
+              echo "✅ Коммит $CURRENT компилируется, используем его как базу"
               break
             fi
+            echo "❌ Коммит $CURRENT не компилируется, откатываюсь на предыдущий"
             git reset --hard HEAD~1
             ATTEMPT=$((ATTEMPT+1))
           done
           if [ $ATTEMPT -eq $MAX_ATTEMPTS ]; then
-            echo "❌ За $MAX_ATTEMPTS попыток не нашли компилируемый коммит"
+            echo "❌ За $MAX_ATTEMPTS попыток не нашли компилируемый коммит апстрима"
             exit 1
           fi
 
-      - name: Inject custom shortcuts code
+      - name: Inject custom shortcuts code (self-healing, applied fresh on top of clean base)
         run: |
           echo "==> Создаю строковые ресурсы..."
           mkdir -p app/src/main/res/values
