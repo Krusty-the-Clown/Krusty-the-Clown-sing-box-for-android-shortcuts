@@ -8,7 +8,7 @@ on:
         required: false
         default: ''
       core_tag:
-        description: 'Тег ИЛИ commit SHA ядра sing-box (пусто = автопоиск максимального beta/rc). Например: v1.14.0-rc.1 или 8dd67a1e49711ce8a9a884bef60a2139ef36446f'
+        description: 'Тег ИЛИ commit SHA ядра sing-box (пусто = автопоиск максимального beta/rc с готовым .aar)'
         required: false
         default: ''
 
@@ -30,11 +30,11 @@ jobs:
           git fetch origin "${{ github.event.inputs.app_ref }}" || true
           git checkout "${{ github.event.inputs.app_ref }}"
 
-      - name: Set up Java
+      - name: Set up Java 17 (Required for core build script)
         uses: actions/setup-java@v5
         with:
           distribution: 'temurin'
-          java-version: '21'
+          java-version: '17'
 
       - name: Resolve core tag (manual override or auto beta/rc search)
         env:
@@ -155,6 +155,13 @@ jobs:
             echo "SKIP_PREBUILT=1" >> $GITHUB_ENV
           fi
 
+      - name: Setup exact Android NDK 28
+        if: ${{ env.SKIP_PREBUILT == '1' }}
+        run: |
+          echo "Устанавливаем NDK 28 для совместимости с cronet-go..."
+          echo "y" | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --install "ndk;28.0.13004108"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.0.13004108" >> $GITHUB_ENV
+
       - name: Build libbox.aar from source (fallback when no prebuilt .aar exists)
         if: ${{ env.SKIP_PREBUILT == '1' }}
         run: |
@@ -189,7 +196,7 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x gradlew
 
-      - name: Auto-find newest commit that actually compiles
+      - name: Auto-find newest commit of clean upstream that actually compiles
         if: ${{ github.event.inputs.app_ref == '' }}
         run: |
           MAX_ATTEMPTS=15
@@ -209,9 +216,9 @@ jobs:
             exit 1
           fi
 
-      - name: Inject Custom Shortcuts Code
+      - name: Inject custom shortcuts code
         run: |
-          echo "==> Создаем ресурсы строк..."
+          echo "==> Создаю строковые ресурсы..."
           mkdir -p app/src/main/res/values
           cat << 'EOF' > app/src/main/res/values/custom_strings.xml
           <?xml version="1.0" encoding="utf-8"?>
@@ -223,7 +230,7 @@ jobs:
           </resources>
           EOF
 
-          echo "==> Создаем shortcuts.xml с нуля..."
+          echo "==> Создаю shortcuts.xml..."
           mkdir -p app/src/main/res/xml
           cat << 'EOF' > app/src/main/res/xml/shortcuts.xml
           <?xml version="1.0" encoding="utf-8"?>
@@ -253,29 +260,33 @@ jobs:
           </shortcuts>
           EOF
 
-          echo "==> Патчим AndroidManifest.xml (добавляем ссылку на ярлыки)..."
+          echo "==> Патчу AndroidManifest.xml (meta-data для ярлыков)..."
           if ! grep -q "android.app.shortcuts" app/src/main/AndroidManifest.xml; then
             sed -i '/\.compose\.MainActivity"/,/<\/activity>/ s/<\/activity>/    <meta-data android:name="android.app.shortcuts" android:resource="@xml\/shortcuts" \/>\n        <\/activity>/' app/src/main/AndroidManifest.xml
           fi
 
-          echo "==> Патчим MainActivity.kt (перехватчики в методах)..."
+          echo "==> Патчу вызовы в onCreate/onNewIntent..."
           sed -i 's/super\.onCreate(savedInstanceState)/super.onCreate(savedInstanceState)\n        if (handleShortcut(intent)) return/' app/src/main/java/io/nekohasekai/sfa/compose/MainActivity.kt
           sed -i 's/super\.onNewIntent(intent)/super.onNewIntent(intent)\n        if (handleShortcut(intent)) return/' app/src/main/java/io/nekohasekai/sfa/compose/MainActivity.kt
 
-          echo "==> Патчим MainActivity.kt (инъекция функции)..."
-          LAST_BRACE_LINE=$(grep -n "}" app/src/main/java/io/nekohasekai/sfa/compose/MainActivity.kt | tail -1 | cut -d: -f1)
+          echo "==> Впрыскиваю саму функцию handleShortcut перед последней закрывающей скобкой класса..."
+          LAST_BRACE_LINE=$(grep -n "^}" app/src/main/java/io/nekohasekai/sfa/compose/MainActivity.kt | tail -1 | cut -d: -f1)
+          if [ -z "$LAST_BRACE_LINE" ]; then
+            echo "❌ Не нашёл закрывающую скобку класса в MainActivity.kt — структура файла изменилась, нужно поправить скрипт"
+            exit 1
+          fi
           sed -i "${LAST_BRACE_LINE},\$d" app/src/main/java/io/nekohasekai/sfa/compose/MainActivity.kt
-          
+
           cat << 'EOF' >> app/src/main/java/io/nekohasekai/sfa/compose/MainActivity.kt
 
               private fun handleShortcut(currentIntent: android.content.Intent?): Boolean {
                   val action = currentIntent?.action
                   if (action == "io.nekohasekai.sfa.ACTION_START") {
-                      try { startService() } catch(e: Exception) {}
+                      try { startService() } catch (e: Exception) {}
                       finish()
                       return true
                   } else if (action == "io.nekohasekai.sfa.ACTION_STOP") {
-                      try { io.nekohasekai.sfa.bg.BoxService.stop() } catch(e: Exception) {}
+                      try { io.nekohasekai.sfa.bg.BoxService.stop() } catch (e: Exception) {}
                       finish()
                       return true
                   }
@@ -283,6 +294,13 @@ jobs:
               }
           }
           EOF
+
+          echo "==> Проверка после инъекции..."
+          if ! grep -q "handleShortcut" app/src/main/java/io/nekohasekai/sfa/compose/MainActivity.kt; then
+            echo "❌ Инъекция не удалась — handleShortcut не найден после патча"
+            exit 1
+          fi
+          echo "✅ Инъекция успешна"
 
       - name: Build APK
         run: ./gradlew assembleOtherDebug --no-daemon
