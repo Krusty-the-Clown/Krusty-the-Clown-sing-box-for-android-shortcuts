@@ -1,6 +1,6 @@
 name: Build APK
 
-on:
+"on":
   workflow_dispatch:
     inputs:
       app_ref:
@@ -36,7 +36,6 @@ jobs:
         if: ${{ env.APP_REF != '' }}
         run: |
           set -euo pipefail
-          echo "Переключаюсь на ref: $APP_REF"
           git fetch --force origin "$APP_REF"
           git checkout --detach "$APP_REF"
 
@@ -51,71 +50,24 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          MANUAL_REF="$CORE_TAG_INPUT"
-
-          if [ -n "$MANUAL_REF" ]; then
-            echo "Указан ref ядра вручную: $MANUAL_REF"
-            if [[ "$MANUAL_REF" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$ ]]; then
-              TARGET_TAG="$MANUAL_REF"
-              CORE_SHA=$(gh api "repos/SagerNet/sing-box/git/ref/tags/$MANUAL_REF" -q '.object.sha')
+          if [ -n "$CORE_TAG_INPUT" ]; then
+            TARGET_TAG="$CORE_TAG_INPUT"
+            if [[ "$TARGET_TAG" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$ ]]; then
+              CORE_SHA=$(gh api "repos/SagerNet/sing-box/git/ref/tags/$TARGET_TAG" -q '.object.sha')
             else
-              CORE_SHA=$(gh api "repos/SagerNet/sing-box/commits/$MANUAL_REF" -q '.sha')
-              TARGET_TAG="$MANUAL_REF"
-            fi
-            if [ -z "$CORE_SHA" ] || [ "$CORE_SHA" = "null" ]; then
-              echo "❌ Не удалось разрешить ref ядра: $MANUAL_REF"
-              exit 1
+              CORE_SHA=$(gh api "repos/SagerNet/sing-box/commits/$TARGET_TAG" -q '.sha')
             fi
           else
-            echo "Ищем самую свежую версию с готовым Android .aar..."
-            ALL_TAGS=$(gh api repos/SagerNet/sing-box/tags --paginate)
-            CANDIDATES=$(echo "$ALL_TAGS" | jq -r '
-              [.[]
-               | select(.name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+(-(beta|rc)\\.[0-9]+)?$"))
-               | . + {parsed: (.name | capture("^v(?<maj>[0-9]+)\\.(?<min>[0-9]+)\\.(?<pat>[0-9]+)(-(?<stage>beta|rc)\\.(?<num>[0-9]+))?$"))}
-               | . + {score: (
-                   (.parsed.maj | tonumber) * 1000000000
-                   + (.parsed.min | tonumber) * 1000000
-                   + (.parsed.pat | tonumber) * 1000
-                   + (if .parsed.stage == null then 900
-                      elif .parsed.stage == "rc" then 500 + (.parsed.num | tonumber)
-                      else (.parsed.num | tonumber) end)
-                 )}
-              ]
-              | sort_by(-.score)
-              | .[] | "\(.name) \(.commit.sha)"')
-
-            TARGET_TAG=""
-            CORE_SHA=""
-            while IFS= read -r line; do
-              [ -z "$line" ] && continue
-              CAND_TAG=${line%% *}
-              CAND_SHA=${line#* }
-              RUN_CHECK=$(gh api "repos/SagerNet/sing-box/actions/runs?head_sha=$CAND_SHA&status=success&per_page=100" \
-                -q '.workflow_runs[] | select(.name == "Build") | .id' | head -n1 || true)
-              [ -z "$RUN_CHECK" ] && continue
-
-              AAR_ARTIFACT=$(gh api "repos/SagerNet/sing-box/actions/runs/$RUN_CHECK/artifacts?per_page=100" \
-                -q '.artifacts[] | select(.name | test("android|aar|libbox"; "i")) | .name' | head -n1 || true)
-              if [ -n "$AAR_ARTIFACT" ]; then
-                TARGET_TAG="$CAND_TAG"
-                CORE_SHA="$CAND_SHA"
-                echo "✅ Выбрано ядро $TARGET_TAG ($CORE_SHA), артефакт: $AAR_ARTIFACT"
-                break
-              fi
-            done <<< "$CANDIDATES"
-
-            if [ -z "$TARGET_TAG" ]; then
-              echo "❌ Не найдено ядро с готовым Android .aar"
-              exit 1
-            fi
+            TARGET_TAG=$(gh api repos/SagerNet/sing-box/tags --paginate | jq -r '
+              [.[] | select(.name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+(-(beta|rc)\\.[0-9]+)?$"))
+               | . + {p: (.name | capture("^v(?<a>[0-9]+)\\.(?<b>[0-9]+)\\.(?<c>[0-9]+)(-(?<s>beta|rc)\\.(?<n>[0-9]+))?$"))}
+               | . + {score: ((.p.a|tonumber)*1000000000 + (.p.b|tonumber)*1000000 + (.p.c|tonumber)*1000 + (if .p.s == null then 900 elif .p.s == "rc" then 500 + (.p.n|tonumber) else (.p.n|tonumber) end))}
+              ] | sort_by(-.score) | .[0].name')
+            [ -n "$TARGET_TAG" ] || { echo 'No sing-box tag found'; exit 1; }
+            CORE_SHA=$(gh api "repos/SagerNet/sing-box/git/ref/tags/$TARGET_TAG" -q '.object.sha')
           fi
-
-          {
-            echo "TARGET_TAG=$TARGET_TAG"
-            echo "CORE_SHA=$CORE_SHA"
-          } >> "$GITHUB_ENV"
-          echo "Тег/ref ядра: $TARGET_TAG ($CORE_SHA)"
+          [ -n "$CORE_SHA" ] && [ "$CORE_SHA" != null ] || { echo 'Could not resolve sing-box ref'; exit 1; }
+          printf 'TARGET_TAG=%s\nCORE_SHA=%s\n' "$TARGET_TAG" "$CORE_SHA" >> "$GITHUB_ENV"
 
       - name: Download official libbox.aar
         env:
@@ -123,31 +75,23 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p app/libs /tmp/artifacts
-          RUN_ID=$(gh api "repos/SagerNet/sing-box/actions/runs?head_sha=$CORE_SHA&status=success&per_page=100" \
-            -q '.workflow_runs[] | select(.name == "Build") | .id' | head -n1 || true)
-
+          RUN_ID=$(gh api "repos/SagerNet/sing-box/actions/runs?head_sha=$CORE_SHA&status=success&per_page=100" -q '.workflow_runs[] | select(.name == "Build") | .id' | head -n1 || true)
           FOUND=0
           if [ -n "$RUN_ID" ]; then
-            mapfile -t ARTIFACT_NAMES < <(gh api "repos/SagerNet/sing-box/actions/runs/$RUN_ID/artifacts?per_page=100" \
-              -q '.artifacts[] | select(.name | test("android|aar|libbox"; "i")) | .name')
-            for name in "${ARTIFACT_NAMES[@]}"; do
-              [ -z "$name" ] && continue
-              echo "Скачиваю артефакт: $name"
+            while IFS= read -r name; do
+              [ -n "$name" ] || continue
               gh run download "$RUN_ID" -R SagerNet/sing-box -n "$name" -D "/tmp/artifacts/$name"
-            done
-            while IFS= read -r -d '' aar_file; do
-              if unzip -l "$aar_file" | grep -q 'arm64-v8a/libbox.so'; then
-                cp "$aar_file" app/libs/libbox.aar
+            done < <(gh api "repos/SagerNet/sing-box/actions/runs/$RUN_ID/artifacts?per_page=100" -q '.artifacts[] | select(.name | test("android|aar|libbox"; "i")) | .name')
+            while IFS= read -r -d '' file; do
+              if unzip -l "$file" | grep -q 'arm64-v8a/libbox.so'; then
+                cp "$file" app/libs/libbox.aar
                 FOUND=1
-                echo "✅ Найден libbox.aar: $aar_file"
                 break
               fi
             done < <(find /tmp/artifacts -type f -name '*.aar' -print0)
           fi
-
           if [ "$FOUND" -eq 0 ]; then
-            echo "SKIP_PREBUILT=1" >> "$GITHUB_ENV"
-            echo "⚠️ Готовый .aar не найден; будет выполнена сборка из исходников"
+            echo 'SKIP_PREBUILT=1' >> "$GITHUB_ENV"
           fi
 
       - name: Build libbox.aar from source
@@ -155,39 +99,21 @@ jobs:
         run: |
           set -euo pipefail
           NDK_VERSION=28.0.13004108
-          echo "y" | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" > /dev/null
+          echo y | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;$NDK_VERSION" >/dev/null
           export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/$NDK_VERSION"
-
           git clone --depth 1 --branch "$TARGET_TAG" https://github.com/SagerNet/sing-box.git /tmp/sing-box-src
-          REQUIRED_GO=$(awk '$1 == "go" { print $2; exit }' /tmp/sing-box-src/go.mod)
-          REQUIRED_GO=${REQUIRED_GO:-1.24.0}
-          curl --fail --silent --show-error --location \
-            "https://go.dev/dl/go${REQUIRED_GO}.linux-amd64.tar.gz" -o /tmp/go.tar.gz
+          GO_VERSION=$(awk '$1 == "go" { print $2; exit }' /tmp/sing-box-src/go.mod)
+          GO_VERSION=${GO_VERSION:-1.24.0}
+          curl --fail --location "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tar.gz
           sudo tar -C /usr/local -xzf /tmp/go.tar.gz
           export PATH="/usr/local/go/bin:$HOME/go/bin:$PATH"
           export GOTOOLCHAIN=local
-
           go install github.com/sagernet/gomobile/cmd/gomobile@v0.1.12
           go install github.com/sagernet/gomobile/cmd/gobind@v0.1.12
           gomobile init
           cd /tmp/sing-box-src
           go run ./cmd/internal/build_libbox -target android
-
-          AAR_PATH=$(find . -maxdepth 1 -type f -name 'libbox.aar' -print -quit)
-          [ -n "$AAR_PATH" ] || { echo "❌ libbox.aar не создан"; exit 1; }
-          cp "$AAR_PATH" "$GITHUB_WORKSPACE/app/libs/libbox.aar"
-
-      - name: Print embedded core version
-        run: |
-          set -euo pipefail
-          rm -rf /tmp/aar_inspect
-          mkdir -p /tmp/aar_inspect
-          unzip -o app/libs/libbox.aar -d /tmp/aar_inspect > /dev/null
-          SO_FILE=$(find /tmp/aar_inspect -type f -path '*/arm64-v8a/libbox.so' -print -quit)
-          if [ -n "$SO_FILE" ]; then
-            strings "$SO_FILE" | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+(-(alpha|beta|rc)\.[0-9]+)?$' | sort -u | head -20 || true
-          fi
-          echo "Целевой ref: $TARGET_TAG ($CORE_SHA)"
+          cp "$(find . -maxdepth 1 -name libbox.aar -print -quit)" "$GITHUB_WORKSPACE/app/libs/libbox.aar"
 
       - name: Make gradlew executable
         run: chmod +x gradlew
@@ -196,29 +122,19 @@ jobs:
         if: ${{ env.APP_REF == '' }}
         run: |
           set -euo pipefail
-          MAX_ATTEMPTS=15
-          ATTEMPT=0
-          while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
-            CURRENT=$(git rev-parse HEAD)
-            echo "Попытка $((ATTEMPT + 1))/$MAX_ATTEMPTS: $CURRENT"
+          for attempt in $(seq 1 15); do
             if ./gradlew :app:compileOtherDebugKotlin --no-daemon; then
-              echo "✅ Используем $CURRENT"
               break
             fi
-            if ! git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
-              echo "❌ Предыдущего коммита больше нет"
-              exit 1
-            fi
+            git rev-parse --verify HEAD~1 >/dev/null || exit 1
             git reset --hard HEAD~1
-            ATTEMPT=$((ATTEMPT + 1))
+            [ "$attempt" -lt 15 ] || exit 1
           done
-          [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ] || { echo "❌ Не найден компилируемый коммит"; exit 1; }
 
       - name: Inject VPN shortcuts
         run: |
           set -euo pipefail
           mkdir -p app/src/main/res/values app/src/main/res/xml
-
           cat > app/src/main/res/values/custom_strings.xml <<'EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
@@ -228,73 +144,39 @@ jobs:
               <string name="shortcut_stop_long">Stop VPN</string>
           </resources>
           EOF
-
           cat > app/src/main/res/xml/shortcuts.xml <<'EOF'
           <?xml version="1.0" encoding="utf-8"?>
           <shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
-              <shortcut
-                  android:shortcutId="start_vpn"
-                  android:enabled="true"
-                  android:icon="@drawable/ic_play_arrow_24"
-                  android:shortcutShortLabel="@string/shortcut_start_short"
-                  android:shortcutLongLabel="@string/shortcut_start_long">
-                  <intent
-                      android:action="io.nekohasekai.sfa.ACTION_START"
-                      android:targetPackage="io.nekohasekai.sfa"
-                      android:targetClass="io.nekohasekai.sfa.compose.MainActivity" />
+              <shortcut android:shortcutId="start_vpn" android:enabled="true" android:icon="@drawable/ic_play_arrow_24" android:shortcutShortLabel="@string/shortcut_start_short" android:shortcutLongLabel="@string/shortcut_start_long">
+                  <intent android:action="io.nekohasekai.sfa.ACTION_START" android:targetPackage="io.nekohasekai.sfa" android:targetClass="io.nekohasekai.sfa.compose.MainActivity" />
               </shortcut>
-              <shortcut
-                  android:shortcutId="stop_vpn"
-                  android:enabled="true"
-                  android:icon="@drawable/ic_stop_24"
-                  android:shortcutShortLabel="@string/shortcut_stop_short"
-                  android:shortcutLongLabel="@string/shortcut_stop_long">
-                  <intent
-                      android:action="io.nekohasekai.sfa.ACTION_STOP"
-                      android:targetPackage="io.nekohasekai.sfa"
-                      android:targetClass="io.nekohasekai.sfa.compose.MainActivity" />
+              <shortcut android:shortcutId="stop_vpn" android:enabled="true" android:icon="@drawable/ic_stop_24" android:shortcutShortLabel="@string/shortcut_stop_short" android:shortcutLongLabel="@string/shortcut_stop_long">
+                  <intent android:action="io.nekohasekai.sfa.ACTION_STOP" android:targetPackage="io.nekohasekai.sfa" android:targetClass="io.nekohasekai.sfa.compose.MainActivity" />
               </shortcut>
           </shortcuts>
           EOF
-
-          python3 <<'PY'
+          python3 - <<'PY'
           from pathlib import Path
-
-          manifest = Path("app/src/main/AndroidManifest.xml")
+          manifest = Path('app/src/main/AndroidManifest.xml')
           text = manifest.read_text()
-          marker = 'android:name="android.app.shortcuts"'
-          if marker not in text:
-              activity = '<activity\n            android:name=".compose.MainActivity"'
-              start = text.find(activity)
-              if start < 0:
-                  raise SystemExit("MainActivity declaration not found")
-              end = text.find('</activity>', start)
-              if end < 0:
-                  raise SystemExit("MainActivity closing tag not found")
-              metadata = '''            <meta-data
-                android:name="android.app.shortcuts"
-                android:resource="@xml/shortcuts" />\n'''
-              text = text[:end] + metadata + text[end:]
+          if 'android.app.shortcuts' not in text:
+              start = text.index('<activity\n            android:name=".compose.MainActivity"')
+              end = text.index('</activity>', start)
+              text = text[:end] + '            <meta-data android:name="android.app.shortcuts" android:resource="@xml/shortcuts" />\n' + text[end:]
               manifest.write_text(text)
-
-          activity = Path("app/src/main/java/io/nekohasekai/sfa/compose/MainActivity.kt")
-          text = activity.read_text()
-          anchor = '''        if (intent == null) {
-            return
-        }
-'''
-          call = '''        if (handleShortcutIntent(intent)) {
+          path = Path('app/src/main/java/io/nekohasekai/sfa/compose/MainActivity.kt')
+          text = path.read_text()
+          marker = '''        if (intent == null) {
             return
         }
 '''
           if 'handleShortcutIntent(intent)' not in text:
-              if anchor not in text:
-                  raise SystemExit("handleIntent null-check anchor not found")
-              text = text.replace(anchor, anchor + call, 1)
-
+              text = text.replace(marker, marker + '''        if (handleShortcutIntent(intent)) {
+            return
+        }
+''', 1)
           if 'private fun handleShortcutIntent(' not in text:
               function = '''
-    /** Handles launcher shortcuts without closing the activity before permission flows finish. */
     private fun handleShortcutIntent(currentIntent: Intent): Boolean {
         return when (currentIntent.action) {
             "io.nekohasekai.sfa.ACTION_START" -> {
@@ -311,17 +193,9 @@ jobs:
         }
     }
 '''
-              class_end = text.rfind('\n}')
-              if class_end < 0:
-                  raise SystemExit("MainActivity class closing brace not found")
-              text = text[:class_end] + function + text[class_end:]
-          activity.write_text(text)
+              text = text[:text.rfind('\n}')] + function + text[text.rfind('\n}'):]
+          path.write_text(text)
           PY
-
-          grep -q 'android.app.shortcuts' app/src/main/AndroidManifest.xml
-          grep -q 'handleShortcutIntent(intent)' app/src/main/java/io/nekohasekai/sfa/compose/MainActivity.kt
-          grep -q 'io.nekohasekai.sfa.ACTION_START' app/src/main/java/io/nekohasekai/sfa/compose/MainActivity.kt
-          echo "✅ Ярлыки добавлены без раннего finish() для Start"
 
       - name: Validate injected Kotlin
         run: ./gradlew :app:compileOtherDebugKotlin --no-daemon
