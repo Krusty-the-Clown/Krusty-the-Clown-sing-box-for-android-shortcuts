@@ -286,7 +286,6 @@ jobs:
                   if (action == "io.nekohasekai.sfa.ACTION_START") {
                       try { startService() } catch (e: Exception) {}
                       moveTaskToBack(true)
-                      android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({ finish() }, 1000)
                       return true
                   } else if (action == "io.nekohasekai.sfa.ACTION_STOP") {
                       try { io.nekohasekai.sfa.bg.BoxService.stop() } catch (e: Exception) {}
