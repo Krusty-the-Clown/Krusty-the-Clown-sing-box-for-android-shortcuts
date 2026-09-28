@@ -286,7 +286,7 @@ jobs:
                   if (action == "io.nekohasekai.sfa.ACTION_START") {
                       try { startService() } catch (e: Exception) {}
                       moveTaskToBack(true)
-                      return true
+                      return false
                   } else if (action == "io.nekohasekai.sfa.ACTION_STOP") {
                       try { io.nekohasekai.sfa.bg.BoxService.stop() } catch (e: Exception) {}
                       finish()
